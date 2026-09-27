@@ -44,6 +44,10 @@ class HuggingFaceReranker(BaseReranker):
                 batch_size=32,  # Default
                 max_length=512,  # Default
                 normalize=True,  # Default
+                trust_remote_code=getattr(config, 'trust_remote_code', None),
+                model_kwargs=getattr(config, 'model_kwargs', None),
+                use_auth_token=getattr(config, 'use_auth_token', None),
+                local_files_only=getattr(config, 'local_files_only', None),
             )
 
         self.config = config
@@ -54,9 +58,20 @@ class HuggingFaceReranker(BaseReranker):
         else:
             self.device = self.config.device
 
-        # Load model and tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model)
-        self.model = AutoModelForSequenceClassification.from_pretrained(self.config.model)
+        # Load model and tokenizer, forwarding the documented HuggingFace
+        # config options that pydantic would otherwise silently drop
+        # (None values fall back to the transformers defaults).
+        load_kwargs = {}
+        if getattr(self.config, 'trust_remote_code', None) is not None:
+            load_kwargs['trust_remote_code'] = self.config.trust_remote_code
+        if getattr(self.config, 'use_auth_token', None) is not None:
+            load_kwargs['use_auth_token'] = self.config.use_auth_token
+        if getattr(self.config, 'local_files_only', None) is not None:
+            load_kwargs['local_files_only'] = self.config.local_files_only
+        model_kwargs = getattr(self.config, 'model_kwargs', None) or {}
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model, **load_kwargs)
+        self.model = AutoModelForSequenceClassification.from_pretrained(self.config.model, **load_kwargs, **model_kwargs)
         self.model.to(self.device)
         self.model.eval()
 
