@@ -192,6 +192,54 @@ def test_col_info_does_not_raise(supabase_instance):
     assert info["name"] == "test_collection"
 
 
+def test_search_l2_distance_converts_to_similarity(supabase_instance, mock_collection):
+    # Regression test for #7130: with index_measure=L2, vecs returns raw Euclidean
+    # distances. search() must convert them to similarity via 1/(1+d), not clamp
+    # with the cosine formula max(0, 1-d).
+    supabase_instance.index_measure = IndexMeasure.L2
+    mock_collection.query.return_value = [("near", 0.2, {}), ("far", 2.5, {})]
+
+    results = supabase_instance.search(query="", vectors=[[0.1, 0.2, 0.3]], top_k=2)
+
+    assert results[0].id == "near"
+    assert results[0].score == pytest.approx(1.0 / 1.2)
+    assert results[1].id == "far"
+    assert results[1].score == pytest.approx(1.0 / 3.5)
+    # nearest match must survive mem0's score_and_rank threshold gate (default 0.1)
+    assert all(r.score >= 0.1 for r in results)
+
+
+def test_search_l1_distance_converts_to_similarity(supabase_instance, mock_collection):
+    supabase_instance.index_measure = IndexMeasure.L1
+    mock_collection.query.return_value = [("near", 0.5, {}), ("far", 1.5, {})]
+
+    results = supabase_instance.search(query="", vectors=[[0.1, 0.2, 0.3]], top_k=2)
+
+    assert results[0].score == pytest.approx(1.0 / 1.5)
+    assert results[1].score == pytest.approx(1.0 / 2.5)
+
+
+def test_search_max_inner_product_negates_value(supabase_instance, mock_collection):
+    # vecs reports max_inner_product as the negated inner product; similarity is -value
+    supabase_instance.index_measure = IndexMeasure.MAX_INNER_PRODUCT
+    mock_collection.query.return_value = [("best", -0.9, {}), ("worst", -0.1, {})]
+
+    results = supabase_instance.search(query="", vectors=[[0.1, 0.2, 0.3]], top_k=2)
+
+    assert results[0].score == pytest.approx(0.9)
+    assert results[1].score == pytest.approx(0.1)
+
+
+def test_search_cosine_conversion_unchanged(supabase_instance, mock_collection):
+    supabase_instance.index_measure = IndexMeasure.COSINE
+    mock_collection.query.return_value = [("a", 0.3, {}), ("b", 2.5, {})]
+
+    results = supabase_instance.search(query="", vectors=[[0.1, 0.2, 0.3]], top_k=2)
+
+    assert results[0].score == pytest.approx(0.7)
+    assert results[1].score == pytest.approx(0.0)
+
+
 def test_preprocess_filters(supabase_instance):
     # Test single filter
     single_filter = {"category": "test"}
