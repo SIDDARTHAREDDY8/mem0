@@ -292,6 +292,14 @@ export class PGVector implements VectorStore {
       if (!collections.includes(this.collectionName)) {
         await this.createCol(this.config.embeddingModelDims);
       }
+
+      // Collections created before created_at existed need it backfilled so
+      // list() can return rows newest-first. NOT NULL DEFAULT NOW() stamps
+      // all pre-existing rows with the migration time.
+      await this.client.query(`
+        ALTER TABLE ${this.col()}
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      `);
     } catch (error) {
       console.error("Error during initialization:", error);
       throw error;
@@ -316,7 +324,8 @@ export class PGVector implements VectorStore {
       CREATE TABLE IF NOT EXISTS ${this.col()} (
         id UUID PRIMARY KEY,
         vector vector(${dims}),
-        payload JSONB
+        payload JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
 
@@ -516,6 +525,7 @@ export class PGVector implements VectorStore {
       SELECT id, payload
       FROM ${this.col()}
       ${filterClause}
+      ORDER BY created_at DESC
       LIMIT $${paramIndex}
     `;
 
