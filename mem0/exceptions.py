@@ -403,6 +403,35 @@ class DependencyError(MemoryError):
         super().__init__(message, error_code, details, suggestion, debug_info)
 
 
+class ClosedMemoryError(MemoryError):
+    """Raised when an operation is attempted on a closed Memory instance.
+
+    This exception is raised when a caller uses a Memory or AsyncMemory instance
+    after close() has released its resources (for example, the SQLite history
+    database). It replaces the AttributeError that previously surfaced when
+    internal state was set to None after close, so use-after-close fails loudly
+    instead of silently losing audit history.
+
+    Example:
+        try:
+            memory.add(content, user_id=user_id)
+        except ClosedMemoryError:
+            # The instance was closed; create a new Memory instead
+            memory = Memory()
+            memory.add(content, user_id=user_id)
+    """
+
+    def __init__(
+        self,
+        message: str = "Memory instance is closed",
+        error_code: str = "MEM_CLOSED_001",
+        details: dict = None,
+        suggestion: str = "The Memory instance has been closed; create a new one or stop issuing operations on it",
+        debug_info: dict = None,
+    ):
+        super().__init__(message, error_code, details, suggestion, debug_info)
+
+
 # Mapping of HTTP status codes to specific exception classes
 HTTP_STATUS_TO_EXCEPTION = {
     400: ValidationError,

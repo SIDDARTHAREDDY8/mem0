@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from mem0.exceptions import LLMError, VectorStoreError
+from mem0.exceptions import ClosedMemoryError, LLMError, VectorStoreError
 from mem0.memory.main import AsyncMemory, Memory
 
 
@@ -1333,3 +1333,125 @@ class TestAsyncPartialInsertFailure:
             )
 
         mock_async_memory.db.save_messages.assert_called_once()
+
+
+class TestCloseRace:
+    """Regression tests for #7440: Memory.close() racing in-flight writes.
+
+    Before the fix, close() set self.db = None while writers were in flight, so
+    history writes died with AttributeError and batch-level history failures
+    were swallowed without a log line. These tests fail on the unfixed code.
+    """
+
+    @pytest.fixture
+    def mock_memory(self, mocker):
+        _setup_mocks(mocker)
+        memory = Memory()
+        memory.config = mocker.MagicMock()
+        memory.config.custom_instructions = None
+        memory.custom_instructions = None
+        memory.api_version = "v1.1"
+        memory.db.get_last_messages = MagicMock(return_value=[])
+        memory.db.save_messages = MagicMock()
+        return memory
+
+    def test_close_then_add_raises_closed_memory_error(self, mocker, mock_memory):
+        """Use-after-close must fail loudly with ClosedMemoryError, not AttributeError."""
+        mocker.patch("mem0.memory.main.capture_event")
+        mock_memory.close()
+        assert mock_memory.db is None
+        with pytest.raises(ClosedMemoryError):
+            mock_memory.add(
+                [{"role": "user", "content": "written AFTER close"}],
+                user_id="u1",
+                infer=False,
+            )
+
+    def test_close_waits_for_inflight_write(self, mocker, mock_memory):
+        """close() must block until an in-flight persistence section completes,
+        so the history row cannot be lost to a db=None window."""
+        import threading
+
+        mocker.patch("mem0.memory.main.capture_event")
+
+        insert_started = threading.Event()
+        insert_release = threading.Event()
+
+        def slow_insert(vectors, ids, payloads):
+            insert_started.set()
+            assert insert_release.wait(timeout=30)
+
+        mock_memory.vector_store.insert = slow_insert
+        history_written = []
+        mock_memory.db.add_history = lambda *a, **k: history_written.append(a)
+
+        errors = []
+
+        def writer():
+            try:
+                mock_memory._create_memory("hello world", {"hello world": [0.1, 0.2, 0.3]}, {"user_id": "u1"})
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        t = threading.Thread(target=writer)
+        t.start()
+        assert insert_started.wait(timeout=30)
+
+        close_done = threading.Event()
+
+        def closer():
+            mock_memory.close()
+            close_done.set()
+
+        ct = threading.Thread(target=closer)
+        ct.start()
+        # close() must NOT return while the write is still in flight
+        assert not close_done.wait(timeout=2)
+
+        insert_release.set()
+        t.join(timeout=30)
+        ct.join(timeout=30)
+
+        assert close_done.is_set()
+        assert not errors
+        assert len(history_written) == 1
+
+    def test_batch_history_failure_is_logged(self, mocker, mock_memory, caplog):
+        """A failing batch_add_history must log the batch-level error with ids
+        before the per-record fallback (previously silent)."""
+        mocker.patch("mem0.memory.main.capture_event")
+        mocker.patch("mem0.memory.main.extract_entities_batch", return_value=[[]])
+        mock_memory.llm.generate_response.return_value = json.dumps({"memory": [{"text": "likes tennis"}]})
+        mock_memory.embedding_model.embed_batch = Mock(return_value=[[0.1, 0.2, 0.3]])
+        mock_memory.vector_store.insert = Mock()
+        mock_memory.db.batch_add_history = Mock(side_effect=RuntimeError("batch boom"))
+        mock_memory.db.add_history = Mock()
+
+        with caplog.at_level(logging.ERROR):
+            result = mock_memory._add_to_vector_store(
+                messages=[{"role": "user", "content": "I like tennis"}],
+                metadata={},
+                filters={},
+                infer=True,
+            )
+
+        assert len(result) == 1
+        batch_logs = [r for r in caplog.records if "Batch history write failed" in r.message]
+        assert len(batch_logs) == 1
+        assert "batch boom" in batch_logs[0].message
+        # Per-record fallback still ran for the single record
+        assert mock_memory.db.add_history.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_close_then_add_raises_closed_memory_error(self, mocker):
+        """AsyncMemory use-after-close must fail loudly with ClosedMemoryError."""
+        _setup_mocks(mocker)
+        memory = AsyncMemory()
+        memory.close()
+        assert memory.db is None
+        with pytest.raises(ClosedMemoryError):
+            await memory.add(
+                [{"role": "user", "content": "written AFTER close"}],
+                user_id="u1",
+                infer=False,
+            )

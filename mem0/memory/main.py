@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 import warnings
@@ -502,6 +503,12 @@ class Memory(MemoryBase):
         self.api_version = self.config.version
         self.custom_instructions = self.config.custom_instructions
 
+        # Close() guards: _closed fails new operations fast after close(), and
+        # _db_lock serializes close() against in-flight persistence sections so a
+        # vector insert can never land without its history row.
+        self._closed = False
+        self._db_lock = threading.RLock()
+
         # Initialize reranker if configured
         self.reranker = None
         if config.reranker:
@@ -813,7 +820,9 @@ class Memory(MemoryBase):
             EmbeddingError: If embedding generation fails.
             LLMError: If LLM operations fail.
             DatabaseError: If database operations fail.
+            ClosedMemoryError: If this instance has been closed via close().
         """
+        self._check_open()
         if timestamp is not None:
             raise ValueError(get_temporal_feature_error_message("sync", "add", "timestamp"))
 
@@ -1044,58 +1053,71 @@ class Memory(MemoryBase):
             self.db.save_messages(messages, session_scope)
             return []
 
-        # Phase 6: Batch persist
-        all_vectors = [r[2] for r in records]
-        all_ids = [r[0] for r in records]
-        all_payloads = [r[3] for r in records]
+        # Phase 6: Batch persist. Held under the close() lock together with the
+        # history writes below: a racing close() either completes first (fail
+        # fast) or waits for this section, so a vector insert can never land
+        # without its history row.
+        with self._db_lock:
+            self._check_open()
 
-        # Only records confirmed to be stored make it into history, entity
-        # links, and the returned results — a record the store rejected must
-        # never be reported back as a successful ADD.
-        persisted_records = []
-        try:
-            self.vector_store.insert(
-                vectors=all_vectors,
-                ids=all_ids,
-                payloads=all_payloads,
-            )
-            persisted_records = records
-        except Exception:
-            # Fallback: insert one by one
-            for rec in records:
-                try:
-                    self.vector_store.insert(vectors=[rec[2]], ids=[rec[0]], payloads=[rec[3]])
-                    persisted_records.append(rec)
-                except Exception as e:
-                    logger.error(f"Failed to insert memory {rec[0]}: {e}")
+            all_vectors = [r[2] for r in records]
+            all_ids = [r[0] for r in records]
+            all_payloads = [r[3] for r in records]
 
-        if not persisted_records:
-            self.db.save_messages(messages, session_scope)
-            raise VectorStoreError(
-                f"Failed to insert any of the {len(records)} extracted memories into the vector store"
-            )
+            # Only records confirmed to be stored make it into history, entity
+            # links, and the returned results — a record the store rejected must
+            # never be reported back as a successful ADD.
+            persisted_records = []
+            try:
+                self.vector_store.insert(
+                    vectors=all_vectors,
+                    ids=all_ids,
+                    payloads=all_payloads,
+                )
+                persisted_records = records
+            except Exception:
+                # Fallback: insert one by one
+                for rec in records:
+                    try:
+                        self.vector_store.insert(vectors=[rec[2]], ids=[rec[0]], payloads=[rec[3]])
+                        persisted_records.append(rec)
+                    except Exception as e:
+                        logger.error(f"Failed to insert memory {rec[0]}: {e}")
 
-        # Batch history
-        history_records = [
-            {
-                "memory_id": r[0],
-                "old_memory": None,
-                "new_memory": r[1],
-                "event": "ADD",
-                "created_at": r[3].get("created_at"),
-                "is_deleted": 0,
-            }
-            for r in persisted_records
-        ]
-        try:
-            self.db.batch_add_history(history_records)
-        except Exception:
-            # Fallback: add one by one
-            for hr in history_records:
-                try:
-                    self.db.add_history(hr["memory_id"], None, hr["new_memory"], "ADD", created_at=hr.get("created_at"))
-                except Exception as e:
-                    logger.error(f"Failed to add history for {hr['memory_id']}: {e}")
+            if not persisted_records:
+                self.db.save_messages(messages, session_scope)
+                raise VectorStoreError(
+                    f"Failed to insert any of the {len(records)} extracted memories into the vector store"
+                )
+
+            # Batch history
+            history_records = [
+                {
+                    "memory_id": r[0],
+                    "old_memory": None,
+                    "new_memory": r[1],
+                    "event": "ADD",
+                    "created_at": r[3].get("created_at"),
+                    "is_deleted": 0,
+                }
+                for r in persisted_records
+            ]
+            try:
+                self.db.batch_add_history(history_records)
+            except Exception as e:
+                # Log the batch-level failure (with ids) before falling back:
+                # a whole-batch failure must never be silent.
+                logger.error(
+                    f"Batch history write failed for {len(history_records)} memories "
+                    f"(ids: {[hr['memory_id'] for hr in history_records]}); "
+                    f"falling back to per-record writes: {e}"
+                )
+                # Fallback: add one by one
+                for hr in history_records:
+                    try:
+                        self.db.add_history(hr["memory_id"], None, hr["new_memory"], "ADD", created_at=hr.get("created_at"))
+                    except Exception as e:
+                        logger.error(f"Failed to add history for {hr['memory_id']}: {e}")
 
         # Phase 7: Batch entity linking
         try:
@@ -1854,6 +1876,7 @@ class Memory(MemoryBase):
             >>> m.update(memory_id="mem_123", text="Likes to play tennis on weekends")
             {'message': 'Memory updated successfully!'}
         """
+        self._check_open()
         capture_event("mem0.update", self, {"memory_id": memory_id, "sync_type": "sync"})
 
         if data is not None:
@@ -1887,6 +1910,7 @@ class Memory(MemoryBase):
         Args:
             memory_id (str): ID of the memory to delete.
         """
+        self._check_open()
         capture_event("mem0.delete", self, {"memory_id": memory_id, "sync_type": "sync"})
 
         existing_memory = self.vector_store.get(vector_id=memory_id)
@@ -1987,21 +2011,27 @@ class Memory(MemoryBase):
         new_metadata["updated_at"] = new_metadata["created_at"]
         new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
 
-        self.vector_store.insert(
-            vectors=[embeddings],
-            ids=[memory_id],
-            payloads=[new_metadata],
-        )
-        self.db.add_history(
-            memory_id,
-            None,
-            data,
-            "ADD",
-            created_at=new_metadata.get("created_at"),
-            updated_at=new_metadata.get("updated_at"),
-            actor_id=new_metadata.get("actor_id"),
-            role=new_metadata.get("role"),
-        )
+        # Hold the close() lock across the vector write AND the history write: a
+        # racing close() either completes first (fail fast below) or waits for
+        # this section, so a vector insert can never land without its history
+        # row.
+        with self._db_lock:
+            self._check_open()
+            self.vector_store.insert(
+                vectors=[embeddings],
+                ids=[memory_id],
+                payloads=[new_metadata],
+            )
+            self.db.add_history(
+                memory_id,
+                None,
+                data,
+                "ADD",
+                created_at=new_metadata.get("created_at"),
+                updated_at=new_metadata.get("updated_at"),
+                actor_id=new_metadata.get("actor_id"),
+                role=new_metadata.get("role"),
+            )
         return memory_id
 
     def _create_procedural_memory(self, messages, metadata=None, prompt=None):
@@ -2174,10 +2204,22 @@ class Memory(MemoryBase):
         display_first_run_notice(self, "sync", "reset")
 
     def close(self):
-        """Release resources held by this Memory instance (SQLite connections, etc.)."""
-        if hasattr(self, "db") and self.db is not None:
-            self.db.close()
-            self.db = None
+        """Release resources held by this Memory instance (SQLite connections, etc.).
+
+        This is a synchronous quiesce gate: it blocks until in-flight write
+        operations finish, so no vector insert can land without its history row,
+        then closes the history database. Any operation attempted after close()
+        raises ClosedMemoryError. Callers that write from background threads are
+        responsible for draining those writers before calling close(); the
+        library fails loudly, not silently, if that contract is broken.
+        """
+        with self._db_lock:
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+            if hasattr(self, "db") and self.db is not None:
+                self.db.close()
+                self.db = None
 
     def __enter__(self):
         return self
@@ -2208,6 +2250,11 @@ class AsyncMemory(MemoryBase):
         self.api_version = self.config.version
         self.custom_instructions = self.config.custom_instructions
         self._entity_store = None
+
+        # Close() guards (see Memory.__init__): _closed fails new operations fast
+        # after close(); _db_lock serializes close() against in-flight writes.
+        self._closed = False
+        self._db_lock = threading.RLock()
 
         # Initialize reranker if configured
         self.reranker = None
@@ -2493,6 +2540,7 @@ class AsyncMemory(MemoryBase):
         Returns:
             dict: A dictionary containing the result of the memory addition operation.
         """
+        self._check_open()
         if timestamp is not None:
             raise ValueError(await get_temporal_feature_error_message_async("async", "add", "timestamp"))
 
@@ -2723,7 +2771,10 @@ class AsyncMemory(MemoryBase):
             await asyncio.to_thread(self.db.save_messages, messages, session_scope)
             return []
 
-        # Phase 6: Batch persist
+        # Phase 6: Batch persist. A threading lock cannot be held across await
+        # points, so the async guard is the closed flag: fail fast before any
+        # vector write can land without its history row.
+        self._check_open()
         all_vectors = [r[2] for r in records]
         all_ids = [r[0] for r in records]
         all_payloads = [r[3] for r in records]
@@ -2770,7 +2821,14 @@ class AsyncMemory(MemoryBase):
         ]
         try:
             await asyncio.to_thread(self.db.batch_add_history, history_records)
-        except Exception:
+        except Exception as e:
+            # Log the batch-level failure (with ids) before falling back: a
+            # whole-batch history failure must never be silent.
+            logger.error(
+                f"Batch history write failed for {len(history_records)} memories "
+                f"(ids: {[hr['memory_id'] for hr in history_records]}) (async); "
+                f"falling back to per-record writes: {e}"
+            )
             for hr in history_records:
                 try:
                     await asyncio.to_thread(
@@ -3532,6 +3590,7 @@ class AsyncMemory(MemoryBase):
             >>> await m.update(memory_id="mem_123", text="Likes to play tennis on weekends")
             {'message': 'Memory updated successfully!'}
         """
+        self._check_open()
         capture_event("mem0.update", self, {"memory_id": memory_id, "sync_type": "async"})
 
         if data is not None:
@@ -3566,6 +3625,7 @@ class AsyncMemory(MemoryBase):
         Args:
             memory_id (str): ID of the memory to delete.
         """
+        self._check_open()
         capture_event("mem0.delete", self, {"memory_id": memory_id, "sync_type": "async"})
 
         existing_memory = await asyncio.to_thread(self.vector_store.get, vector_id=memory_id)
@@ -3683,6 +3743,12 @@ class AsyncMemory(MemoryBase):
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
         new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
+
+        # Fail fast on a closed instance: the vector insert must never land
+        # without its history row. (The sync variant additionally holds
+        # _db_lock across both writes; a threading lock cannot be held across
+        # await points here, so the closed flag is the async guard.)
+        self._check_open()
 
         await asyncio.to_thread(
             self.vector_store.insert,
@@ -3896,10 +3962,22 @@ class AsyncMemory(MemoryBase):
         await display_first_run_notice_async(self, "async", "reset")
 
     def close(self):
-        """Release resources held by this AsyncMemory instance."""
-        if hasattr(self, "db") and self.db is not None:
-            self.db.close()
-            self.db = None
+        """Release resources held by this AsyncMemory instance.
+
+        This is a synchronous quiesce gate: it blocks until in-flight write
+        operations finish, so no vector insert can land without its history row,
+        then closes the history database. Any operation attempted after close()
+        raises ClosedMemoryError. Callers that write from background tasks are
+        responsible for draining those writers before calling close(); the
+        library fails loudly, not silently, if that contract is broken.
+        """
+        with self._db_lock:
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+            if hasattr(self, "db") and self.db is not None:
+                self.db.close()
+                self.db = None
 
     async def __aenter__(self):
         return self

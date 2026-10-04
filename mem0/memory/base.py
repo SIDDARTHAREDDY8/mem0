@@ -1,7 +1,22 @@
 from abc import ABC, abstractmethod
 
+from mem0.exceptions import ClosedMemoryError
+
 
 class MemoryBase(ABC):
+    def _check_open(self):
+        """Raise ClosedMemoryError if close() has released this instance.
+
+        Call this at the start of public operations and inside locked
+        persistence sections so use-after-close fails loudly with a typed
+        error instead of an AttributeError from a None'd-out handle.
+        """
+        if getattr(self, "_closed", False):
+            raise ClosedMemoryError(
+                message="This Memory instance has been closed; operations after close() are not allowed",
+                error_code="MEM_CLOSED_001",
+            )
+
     @abstractmethod
     def get(self, memory_id):
         """
